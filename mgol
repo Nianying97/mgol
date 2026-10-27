@@ -1,0 +1,173 @@
+
+from typing import Mapping
+
+import torch
+from torch import nn
+from torch.nn import functional as F
+
+
+class DomainPrivateEncoder(nn.Module):
+    """Section IV-A: two normalized hidden layers and a bare linear output."""
+
+    def __init__(self, input_dim, hidden_dims, latent_dim, dropout):
+        super().__init__()
+        layers = []
+        for width in hidden_dims:
+            layers.extend([nn.Linear(input_dim, width), nn.LayerNorm(width),
+                           nn.GELU(), nn.Dropout(dropout)])
+            input_dim = width
+        layers.append(nn.Linear(input_dim, latent_dim))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class FisherRaoTemporalEnhancement(nn.Module):
+    """Section IV-B, Eqs. (1)-(2); distances are evaluated in float32."""
+
+    def __init__(self, latent_dim, probability_dim):
+        super().__init__()
+        self.projection = nn.Linear(latent_dim, probability_dim)
+        self.theta_p = nn.Parameter(torch.zeros(()))
+        self.theta_g = nn.Parameter(torch.zeros(()))
+        self.eta_g = nn.Parameter(torch.zeros(()))
+
+    def forward(self, z):
+        with torch.autocast(device_type=z.device.type, enabled=False):
+            logits = F.linear(z.float(), self.projection.weight.float(),
+                              self.projection.bias.float())
+            p = torch.softmax(logits / (F.softplus(self.theta_p.float()) + 1e-6), -1)
+            # The floor protects sqrt's derivative when softmax underflows.
+            phi = F.normalize(p.clamp_min(1e-12).sqrt(), dim=-1)
+            cosine = (phi[:, 1:] * phi[:, :-1]).sum(-1)
+            tail = 2 * torch.acos(cosine.clamp(-1 + 1e-6, 1 - 1e-6))
+            distance = F.pad(tail, (1, 0), value=0)
+            attention = torch.softmax(
+                distance / (F.softplus(self.theta_g.float()) + 1e-6), dim=1)
+            enhanced = z.float() * (1 + F.softplus(self.eta_g.float()) * attention[..., None])
+        return enhanced.to(z.dtype), distance, attention
+
+
+class OverlappingLocalGeometry(nn.Module):
+    """Section IV-C: angular/semantic routing, applied before AND after GELU."""
+
+    def __init__(self, latent_dim, num_units, affinity_weight):
+        super().__init__()
+        self.affinity_weight = affinity_weight
+        self.centers = nn.Parameter(torch.empty(num_units, latent_dim))
+        nn.init.xavier_uniform_(self.centers)
+        self.center_offset = nn.Parameter(torch.zeros_like(self.centers))
+        self.local_weight = nn.Parameter(torch.eye(latent_dim).repeat(num_units, 1, 1))
+        self.scale = nn.Parameter(torch.ones(num_units, latent_dim))
+        self.semantic_gate = nn.Linear(latent_dim, num_units)
+        self.norm = nn.LayerNorm(latent_dim)
+        self.output = nn.Linear(latent_dim, latent_dim)
+
+    def forward(self, z):
+        centers = self.centers + self.center_offset
+        affinity = F.normalize(z, dim=-1, eps=1e-6) @ F.normalize(
+            centers, dim=-1, eps=1e-6).T
+        weights = torch.softmax(self.semantic_gate(z) + self.affinity_weight * affinity, -1)
+        # W[u, output, input]. No undocumented local bias or center subtraction.
+        linear = torch.einsum('bti,uoi->btuo', z, self.local_weight)
+        local = F.gelu(weights[..., None] * linear)
+        mixed = (weights[..., None] * local).sum(-2)
+        mixed_scale = weights @ self.scale
+        return self.output(self.norm(mixed * mixed_scale)), weights, affinity
+
+
+class TemporalBlock(nn.Module):
+    """Section IV-D, Eqs. (5)-(7): standard attention, post-residual LayerNorm."""
+
+    def __init__(self, dim, heads, ffn_dim, dropout):
+        super().__init__()
+        self.attention = nn.MultiheadAttention(dim, heads, dropout=dropout, batch_first=True)
+        self.norm1 = nn.LayerNorm(dim)
+        self.norm2 = nn.LayerNorm(dim)
+        self.ffn = nn.Sequential(nn.Linear(dim, ffn_dim), nn.GELU(),
+                                 nn.Dropout(dropout), nn.Linear(ffn_dim, dim))
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        attended = self.attention(x, x, x, need_weights=False)[0]
+        middle = self.norm1(x + self.dropout(attended))
+        return self.norm2(middle + self.dropout(self.ffn(middle)))
+
+
+class SharedMGOLBackbone(nn.Module):
+    def __init__(self, cfg):
+        super().__init__()
+        dim = cfg['latent_dim']
+        self.fisher_rao = FisherRaoTemporalEnhancement(dim, cfg['probability_dim'])
+        self.local_geometry = OverlappingLocalGeometry(dim, cfg['num_units'], cfg['affinity_weight'])
+        self.position = nn.Parameter(torch.empty(1, cfg['seq_len'], dim))
+        nn.init.normal_(self.position, std=0.02)
+        self.layers = nn.ModuleList([TemporalBlock(dim, cfg['num_heads'], cfg['ffn_dim'],
+                                                  cfg['dropout'])
+                                     for _ in range(cfg['num_layers'])])
+        self.output = nn.Linear(dim, cfg['output_dim'])
+
+    def forward(self, z):
+        enhanced, distance, attention = self.fisher_rao(z)
+        local, routing, affinity = self.local_geometry(enhanced)
+        h = local + self.position
+        for layer in self.layers:
+            h = layer(h)
+        return self.output(h), {'routing': routing, 'affinity': affinity,
+                                'fisher_distance': distance, 'temporal_attention': attention}
+
+
+class DomainClassifier(nn.Module):
+    """Section IV-D, Eq. (8): private BatchNorm, GELU and dropout hidden layers."""
+
+    def __init__(self, input_dim, hidden_dims, num_classes, dropout):
+        super().__init__()
+        layers = []
+        for width in hidden_dims:
+            layers.extend([nn.Linear(input_dim, width), nn.BatchNorm1d(width),
+                           nn.GELU(), nn.Dropout(dropout)])
+            input_dim = width
+        layers.append(nn.Linear(input_dim, num_classes))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x)
+
+
+class MGOL(nn.Module):
+    """Known-domain joint detection; forward accepts a single domain at inference."""
+
+    def __init__(self, domain_info: Mapping, cfg: Mapping):
+        super().__init__()
+        self.seq_len = cfg['seq_len']
+        self.encoders = nn.ModuleDict({d: DomainPrivateEncoder(
+            info['input_dim'], cfg['encoder_hidden_dims'], cfg['latent_dim'], cfg['dropout'])
+            for d, info in domain_info.items()})
+        self.shared = SharedMGOLBackbone(cfg)
+        self.heads = nn.ModuleDict({d: DomainClassifier(
+            cfg['output_dim'], cfg['classifier_hidden_dims'], info['num_classes'], cfg['dropout'])
+            for d, info in domain_info.items()})
+
+    def _encode(self, x, domain):
+        if domain not in self.encoders:
+            raise ValueError(f'Unknown domain: {domain}')
+        if x.ndim != 3 or x.shape[1] != self.seq_len:
+            raise ValueError(f'Expected [batch, {self.seq_len}, input_dim]')
+        return self.encoders[domain](x)
+
+    def forward(self, x, domain):
+        temporal, auxiliary = self.shared(self._encode(x, domain))
+        return self.heads[domain](temporal[:, -1]), auxiliary
+
+    def forward_joint(self, batches):
+        domains = list(batches)
+        if not domains:
+            raise ValueError('At least one active domain is required')
+        sizes = [len(batches[d]) for d in domains]
+        encoded = torch.cat([self._encode(batches[d], d) for d in domains])
+        temporal, auxiliary = self.shared(encoded)
+        parts = temporal.split(sizes)
+        aux_parts = {k: v.split(sizes) for k, v in auxiliary.items()}
+        return {d: (self.heads[d](parts[i][:, -1]),
+                    {k: v[i] for k, v in aux_parts.items()}) for i, d in enumerate(domains)}
