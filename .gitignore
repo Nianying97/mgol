@@ -1,0 +1,54 @@
+# Private experiment configuration and credentials
+private/
+configs/private/
+*.private.json
+*.local.json
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Data, fitted transformations, checkpoints, predictions and logs
+data/
+dataset/
+datasets/
+runs/
+results/
+checkpoints/
+logs/
+cache/
+*.csv
+*.tsv
+*.parquet
+*.feather
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.joblib
+*.pt
+*.pth
+*.ckpt
+*.log
+history.json
+test_metrics.json
+predictions.json
+
+# Submission material and analysis artifacts
+*.pdf
+*.docx
+*.xlsx
+*.rar
+*.zip
+
+# Python / editor / environment files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
