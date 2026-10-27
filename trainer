@@ -1,0 +1,140 @@
+
+import contextlib
+from pathlib import Path
+
+import numpy as np
+import torch
+from torch import nn
+from torch.utils.data import DataLoader
+
+from utils import classification_metrics, write_json
+
+
+def build_loaders(data, cfg, seed):
+    loaders = {name: {} for name in ['train', 'val', 'test']}
+    for index, (domain, bundle) in enumerate(data.items()):
+        for split, dataset in bundle.datasets.items():
+            train = split == 'train'
+            loader = DataLoader(dataset, batch_size=cfg['batch_size'] if train else cfg['eval_batch_size'],
+                                shuffle=train, drop_last=train, num_workers=cfg['num_workers'],
+                                generator=torch.Generator().manual_seed(seed + index))
+            if not len(loader):
+                raise ValueError(f'{domain}/{split} has no batches; lower batch_size or supply more data')
+            loaders[split][domain] = loader
+    return loaders
+
+
+@torch.no_grad()
+def evaluate(model, loaders, data, device):
+    model.eval()
+    result = {}
+    for domain, loader in loaders.items():
+        true, predicted = [], []
+        for x, y in loader:
+            logits, _ = model(x.to(device), domain)
+            true.extend(y.tolist())
+            predicted.extend(logits.argmax(-1).cpu().tolist())
+        result[domain] = classification_metrics(true, predicted, len(data[domain].classes),
+                                                data[domain].benign_index)
+    return result
+
+
+def save_checkpoint(path, model, cfg, domain_info, data, stage, metrics):
+    torch.save({'format_version': 1, 'state_dict': model.state_dict(),
+                'model_config': cfg['model'], 'training_config': cfg['training'],
+                'seed': cfg['seed'], 'split_config': cfg['split'], 'domain_info': domain_info,
+                'preprocessing': {d: bundle.preprocessing for d, bundle in data.items()},
+                'split_summary': {d: bundle.split_summary for d, bundle in data.items()},
+                'stage': stage, 'validation_metrics': metrics}, path)
+
+
+def train(model, data, domain_info, cfg, device, output_dir):
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    t = cfg['training']
+    loaders = build_loaders(data, t, cfg['seed'])
+    domains = list(data)
+    # Same number of batches for each domain. Larger domains are reshuffled
+    # each epoch; this explicit epoch convention is not fixed in the manuscript.
+    steps = min(len(v) for v in loaders['train'].values())
+    criterion = nn.CrossEntropyLoss()
+    amp = t['amp'] and device.type == 'cuda'
+    amp_dtype = torch.bfloat16 if amp and torch.cuda.is_bf16_supported() else torch.float16
+    scaler = torch.amp.GradScaler('cuda', enabled=amp and amp_dtype == torch.float16)
+    history = []
+    for stage, epochs in [('pretrain', t['pretrain_epochs']), ('finetune', t['finetune_epochs'])]:
+        if stage == 'pretrain':
+            optimizer = torch.optim.AdamW(model.parameters(), lr=t['lr_pretrain'],
+                                         weight_decay=t['weight_decay'])
+        else:
+            # Section IV-E fixes the shared fine-tuning rate to 0.1 * eta_pre.
+            optimizer = torch.optim.AdamW([
+                {'params': model.shared.parameters(), 'lr': 0.1 * t['lr_pretrain']},
+                {'params': list(model.encoders.parameters()) + list(model.heads.parameters()),
+                 'lr': t['lr_private_finetune']}], weight_decay=t['weight_decay'])
+        best_score = -float('inf')
+        checkpoint = output_dir / f'{stage}_best.pt'
+
+        def update(loss):
+            if not torch.isfinite(loss):
+                raise FloatingPointError('Nonfinite training loss')
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            # FP16 GradScaler handles overflow by skipping the update and
+            # reducing its scale. FP32/BF16 nonfinite gradients are errors.
+            nn.utils.clip_grad_norm_(model.parameters(), t['grad_clip'],
+                                     error_if_nonfinite=not scaler.is_enabled())
+            previous_scale = scaler.get_scale()
+            scaler.step(optimizer)
+            scaler.update()
+            return scaler.get_scale() >= previous_scale
+
+        for epoch in range(epochs):
+            model.train()
+            iterators = {d: iter(loader) for d, loader in loaders['train'].items()}
+            total_loss, updates, skipped_updates = 0.0, 0, 0
+            for _ in range(steps):
+                if stage == 'pretrain':
+                    for domain in domains:
+                        x, y = next(iterators[domain])
+                        optimizer.zero_grad(set_to_none=True)
+                        context = torch.autocast('cuda', dtype=amp_dtype) if amp else contextlib.nullcontext()
+                        with context:
+                            loss = criterion(model(x.to(device), domain)[0], y.to(device))
+                        skipped_updates += int(not update(loss))
+                        total_loss += float(loss.detach())
+                        updates += 1
+                else:
+                    batch_x, batch_y = {}, {}
+                    for domain in domains:
+                        x, y = next(iterators[domain])
+                        batch_x[domain], batch_y[domain] = x.to(device), y.to(device)
+                    optimizer.zero_grad(set_to_none=True)
+                    context = torch.autocast('cuda', dtype=amp_dtype) if amp else contextlib.nullcontext()
+                    with context:
+                        outputs = model.forward_joint(batch_x)
+                        # Mean of per-domain batch-mean CE, not pooled sample CE.
+                        loss = torch.stack([criterion(outputs[d][0], batch_y[d]) for d in domains]).mean()
+                    skipped_updates += int(not update(loss))
+                    total_loss += float(loss.detach())
+                    updates += 1
+            if skipped_updates == updates:
+                raise FloatingPointError('All AMP updates overflowed. Disable amp or check input scales.')
+            metrics = evaluate(model, loaders['val'], data, device)
+            score = float(np.mean([m['macro_f1'] for m in metrics.values()]))
+            row = {'stage': stage, 'epoch': epoch + 1, 'loss': total_loss / updates,
+                   'validation': metrics, 'domain_mean_macro_f1': score,
+                   'amp_skipped_updates': skipped_updates}
+            history.append(row)
+            write_json(output_dir / 'history.json', history)
+            print(f'{stage} {epoch + 1}/{epochs}: loss={row["loss"]:.6f}, val_macro_f1={score:.6f}', flush=True)
+            if score > best_score:
+                best_score = score
+                save_checkpoint(checkpoint, model, cfg, domain_info, data, stage, metrics)
+        # Stage 2 starts from stage 1's validation-selected checkpoint.
+        saved = torch.load(checkpoint, map_location=device, weights_only=True)
+        model.load_state_dict(saved['state_dict'])
+    # Test labels never affect checkpoint selection, scheduling, or gradients.
+    result = evaluate(model, loaders['test'], data, device)
+    write_json(output_dir / 'test_metrics.json', result)
+    return result
