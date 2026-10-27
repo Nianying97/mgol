@@ -1,0 +1,210 @@
+
+from dataclasses import dataclass
+
+import numpy as np
+import pandas as pd
+import torch
+from sklearn.model_selection import GroupShuffleSplit
+from torch.utils.data import Dataset
+
+
+def assign_units(frame, spec, split_cfg, seed):
+    """Assign complete collection units before any preprocessing or windows."""
+    if frame.columns.duplicated().any():
+        raise ValueError('Duplicate CSV column names are not supported')
+    label = spec['label_column']
+    if label not in frame or frame[label].isna().any():
+        raise ValueError(f'Missing label column or missing labels: {label}')
+    if {'__row__', '__unit__'} & set(frame.columns):
+        raise ValueError('CSV contains reserved internal column names')
+    frame = frame.copy().reset_index(drop=True)
+    frame['__row__'] = np.arange(len(frame))
+    group_cols = spec['group_columns']
+    if group_cols:
+        if frame[group_cols].isna().any().any():
+            raise ValueError('Collection identifiers must not contain missing values')
+        frame['__unit__'] = pd.factorize(pd.MultiIndex.from_frame(frame[group_cols]))[0]
+    else:
+        block_size = spec['block_size']
+        frame['__unit__'] = np.arange(len(frame)) // block_size
+    y = frame[label].astype(str).to_numpy()
+    groups = frame['__unit__'].to_numpy()
+
+    def partition(indices, fraction, local_seed):
+        expected = set(y[indices])
+        # Labels are used only to establish class coverage at split time.
+        # Candidate selection never observes model scores or fitted features.
+        splitter = GroupShuffleSplit(n_splits=128, test_size=fraction, random_state=local_seed)
+        try:
+            for left, right in splitter.split(indices, y[indices], groups[indices]):
+                a, b = indices[left], indices[right]
+                if set(y[a]) == expected and set(y[b]) == expected:
+                    return np.sort(a), np.sort(b)
+        except ValueError as exc:
+            raise ValueError('Not enough independent units for the requested split') from exc
+        raise ValueError('Cannot retain every class in disjoint units. Preserve more collection '
+                         'units or revise contiguous block size; no random-window fallback is used.')
+
+    pool, test = partition(np.arange(len(frame)), split_cfg['test_fraction'], seed)
+    train, val = partition(pool, split_cfg['validation_fraction_of_train'], seed + 1)
+    result = {name: frame.iloc[idx].copy() for name, idx in
+              [('train', train), ('val', val), ('test', test)]}
+    units = {k: set(v['__unit__']) for k, v in result.items()}
+    if any(units[a] & units[b] for a, b in [('train', 'val'), ('train', 'test'), ('val', 'test')]):
+        raise RuntimeError('Internal error: split units overlap')
+    return result
+
+
+class TabularTransform:
+    """Training medians, categorical vocabularies and raw numeric scales."""
+
+    def fit(self, frame, columns):
+        if not columns or len(columns) != len(set(columns)):
+            raise ValueError('feature_columns must be a nonempty unique list')
+        self.columns = list(columns)
+        self.categories, self.medians = {}, {}
+        for col in columns:
+            values = frame[col]
+            if pd.api.types.is_numeric_dtype(values):
+                values = pd.to_numeric(values, errors='coerce').replace([np.inf, -np.inf], np.nan)
+                med = values.median()
+                self.medians[col] = float(med) if np.isfinite(med) else 0.0
+            else:
+                self.categories[col] = {v: i for i, v in enumerate(sorted(values.dropna().astype(str).unique()))}
+        matrix = self._encode(frame)
+        self.mean = matrix.mean(0, dtype=np.float64)
+        self.std = np.maximum(matrix.std(0, dtype=np.float64), 1e-6)
+        return self
+
+    def _encode(self, frame):
+        result = []
+        for col in self.columns:
+            if col in self.categories:
+                values = frame[col].map(lambda v: self.categories[col].get(str(v), -1))
+            else:
+                values = pd.to_numeric(frame[col], errors='coerce').replace(
+                    [np.inf, -np.inf], np.nan).fillna(self.medians[col])
+            result.append(values.to_numpy(dtype=np.float64))
+        return np.stack(result, axis=-1)
+
+    def transform(self, frame):
+        matrix = self._encode(frame)
+        normalized = (matrix - self.mean) / self.std
+        if not np.isfinite(normalized).all():
+            raise ValueError('Nonfinite features after transformation')
+        normalized = normalized.astype(np.float32)
+        if not np.isfinite(normalized).all():
+            raise ValueError('Features exceed float32 range')
+        return normalized
+
+    def state_dict(self):
+        return {k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in vars(self).items()}
+
+    @classmethod
+    def from_state_dict(cls, state):
+        obj = cls()
+        obj.__dict__.update(state)
+        obj.mean, obj.std = np.asarray(obj.mean), np.asarray(obj.std)
+        return obj
+
+
+class SequenceDataset(Dataset):
+    """Store each local window once; create consecutive sequences lazily."""
+
+    def __init__(self, segments, seq_len):
+        self.segments, self.seq_len = segments, seq_len
+        counts = [max(0, len(x) - seq_len + 1) for x, _ in segments]
+        self.ends = np.cumsum(counts)
+        self.input_dim = segments[0][0].shape[-1]
+
+    def __len__(self):
+        return int(self.ends[-1]) if len(self.ends) else 0
+
+    def __getitem__(self, index):
+        if index < 0 or index >= len(self):
+            raise IndexError(index)
+        part = int(np.searchsorted(self.ends, index, side='right'))
+        local = index - (int(self.ends[part - 1]) if part else 0)
+        x, y = self.segments[part]
+        seq = x[local:local + self.seq_len]
+        return torch.from_numpy(np.ascontiguousarray(seq, dtype=np.float32)), int(y[local + self.seq_len - 1])
+
+    def sequence_labels(self):
+        return np.concatenate([y[self.seq_len - 1:] for x, y in self.segments if len(x) >= self.seq_len])
+
+
+def build_segments(frame, spec, transform, class_map, seq_len):
+    segments = []
+    for _, unit in frame.groupby('__unit__', sort=False):
+        # Within a collection unit, retain the CSV's original chronological order.
+        values = transform.transform(unit)
+        length, stride = spec['window_size'], spec['stride']
+        if len(values) < length + (seq_len - 1) * stride:
+            continue
+        view = np.lib.stride_tricks.sliding_window_view(values, length, axis=0)
+        view = np.moveaxis(view, -1, 1)[::stride]
+        # Preserve raw field values after train-fitted preprocessing. No
+        # histograms, statistical reconstruction or motion-derived features.
+        features = view.reshape(len(view), -1)
+        y = unit[spec['label_column']].astype(str).map(class_map).to_numpy(dtype=np.int64)
+        labels = y[length - 1::stride]
+        segments.append((features, labels))
+    if not segments:
+        raise ValueError('No complete sequences in a split; check unit length and sequence settings')
+    return segments
+
+
+@dataclass
+class DomainData:
+    datasets: dict
+    classes: list
+    benign_index: int
+    preprocessing: dict
+    split_summary: dict
+
+
+def prepare_domain(frame, spec, cfg):
+    splits = assign_units(frame, spec, cfg['split'], cfg['seed'])
+    columns = spec['feature_columns']
+    forbidden = set(spec['group_columns']) | {spec['label_column'], '__row__', '__unit__'}
+    if columns is None:
+        columns = [c for c in frame.columns if c not in forbidden]
+    if forbidden.intersection(columns):
+        raise ValueError('Labels and collection IDs must not be input features')
+    transform = TabularTransform().fit(splits['train'], columns)
+    classes = sorted(splits['train'][spec['label_column']].astype(str).unique())
+    if spec['benign_label'] not in classes:
+        raise ValueError('benign_label must match an explicit training label')
+    class_map = {name: i for i, name in enumerate(classes)}
+    seq_len = cfg['model']['seq_len']
+    segments = {name: build_segments(part, spec, transform, class_map, seq_len)
+                for name, part in splits.items()}
+    datasets = {k: SequenceDataset(v, seq_len) for k, v in segments.items()}
+    for name, dataset in datasets.items():
+        if set(dataset.sequence_labels()) != set(range(len(classes))):
+            raise ValueError(f'{name}: some classes vanished after final-window labeling; '
+                             'supply more independent collection units or revise blocking')
+    summary = {k: {'rows': len(v), 'units': int(v['__unit__'].nunique()),
+                   'sequences': len(datasets[k])} for k, v in splits.items()}
+    state = {'tabular': transform.state_dict(), 'classes': classes, 'spec': dict(spec)}
+    return DomainData(datasets, classes, class_map[spec['benign_label']], state, summary)
+
+
+def inference_dataset(frame, state, seq_len):
+    """Transform a new single-domain CSV with checkpoint-fitted preprocessing.
+
+    Labels may be absent. No statistic or category mapping is refitted.
+    """
+    spec = state['spec']
+    frame = frame.copy().reset_index(drop=True)
+    if spec['group_columns']:
+        if frame[spec['group_columns']].isna().any().any():
+            raise ValueError('Missing collection IDs')
+        frame['__unit__'] = pd.factorize(pd.MultiIndex.from_frame(frame[spec['group_columns']]))[0]
+    else:
+        frame['__unit__'] = np.arange(len(frame)) // spec['block_size']
+    # Dummy labels only support the Dataset interface; they never enter prediction.
+    frame[spec['label_column']] = state['classes'][0]
+    transform = TabularTransform.from_state_dict(state['tabular'])
+    segments = build_segments(frame, spec, transform, {state['classes'][0]: 0}, seq_len)
+    return SequenceDataset(segments, seq_len)
