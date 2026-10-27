@@ -1,0 +1,38 @@
+
+import json
+import random
+from pathlib import Path
+
+import numpy as np
+import torch
+from sklearn.metrics import accuracy_score, confusion_matrix, f1_score
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
+    # Exact bitwise equivalence across devices / software versions is not promised.
+
+
+def classification_metrics(y_true, y_pred, num_classes, benign_index):
+    matrix = confusion_matrix(y_true, y_pred, labels=list(range(num_classes)))
+    benign_total = int(matrix[benign_index].sum())
+    false_positives = benign_total - int(matrix[benign_index, benign_index])
+    return {'accuracy': float(accuracy_score(y_true, y_pred)),
+            'macro_f1': float(f1_score(y_true, y_pred, labels=list(range(num_classes)),
+                                       average='macro', zero_division=0)),
+            'fpr': false_positives / benign_total if benign_total else None,
+            'confusion_matrix': matrix.tolist(), 'samples': len(y_true)}
+
+
+def write_json(path, value):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open('w', encoding='utf-8') as handle:
+        json.dump(value, handle, ensure_ascii=False, indent=2, allow_nan=False)
+        handle.write('\n')
