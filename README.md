@@ -22,8 +22,6 @@ Inference requires only the input and identifier of the current domain.
 ├── config.schema.json           # Configuration field types
 ├── utils.py                     # Seeding, metrics, JSON output
 ├── requirements.txt
-├── docs/
-│   └── METHOD_ALIGNMENT.md       # Equations and implementation choices
 └── tests/
     └── test_mgol.py              # Synthetic correctness tests
 ```
