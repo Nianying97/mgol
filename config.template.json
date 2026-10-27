@@ -1,0 +1,51 @@
+{
+  "seed": null,
+  "split": {
+    "test_fraction": null,
+    "validation_fraction_of_train": null
+  },
+  "model": {
+    "affinity_weight": null,
+    "classifier_hidden_dims": [
+      null,
+      null
+    ],
+    "dropout": null,
+    "encoder_hidden_dims": [
+      null,
+      null
+    ],
+    "ffn_dim": null,
+    "latent_dim": null,
+    "num_heads": null,
+    "num_layers": null,
+    "num_units": null,
+    "output_dim": null,
+    "probability_dim": null,
+    "seq_len": null
+  },
+  "training": {
+    "amp": null,
+    "batch_size": null,
+    "eval_batch_size": null,
+    "finetune_epochs": null,
+    "grad_clip": null,
+    "lr_pretrain": null,
+    "lr_private_finetune": null,
+    "num_workers": null,
+    "pretrain_epochs": null,
+    "weight_decay": null
+  },
+  "domains": {
+    "domain_1": {
+      "csv": "path/to/domain.csv",
+      "label_column": "Label",
+      "benign_label": "Benign",
+      "feature_columns": null,
+      "group_columns": [],
+      "block_size": null,
+      "window_size": null,
+      "stride": null
+    }
+  }
+}

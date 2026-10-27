@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "MGOL private configuration",
+  "description": "Types only; cross-field constraints are also enforced by config.py.",
+  "type": "object",
+  "properties": {
+    "seed": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "split": {
+      "type": "object",
+      "properties": {
+        "test_fraction": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "validation_fraction_of_train": {
+          "type": "number",
+          "exclusiveMinimum": 0,
+          "exclusiveMaximum": 1
+        }
+      },
+      "required": [
+        "test_fraction",
+        "validation_fraction_of_train"
+      ],
+      "additionalProperties": false
+    },
+    "model": {
+      "type": "object",
+      "properties": {
+        "affinity_weight": {
+          "type": "number",
+          "minimum": 0
+        },
+        "classifier_hidden_dims": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "dropout": {
+          "type": "number",
+          "minimum": 0,
+          "exclusiveMaximum": 1
+        },
+        "encoder_hidden_dims": {
+          "type": "array",
+          "items": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "minItems": 2,
+          "maxItems": 2
+        },
+        "ffn_dim": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "latent_dim": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "num_heads": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "num_layers": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "num_units": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "output_dim": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "probability_dim": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "seq_len": {
+          "type": "integer",
+          "minimum": 1
+        }
+      },
+      "required": [
+        "affinity_weight",
+        "classifier_hidden_dims",
+        "dropout",
+        "encoder_hidden_dims",
+        "ffn_dim",
+        "latent_dim",
+        "num_heads",
+        "num_layers",
+        "num_units",
+        "output_dim",
+        "probability_dim",
+        "seq_len"
+      ],
+      "additionalProperties": false
+    },
+    "training": {
+      "type": "object",
+      "properties": {
+        "amp": {
+          "type": "boolean"
+        },
+        "batch_size": {
+          "type": "integer",
+          "minimum": 2
+        },
+        "eval_batch_size": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "finetune_epochs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "grad_clip": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "lr_pretrain": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "lr_private_finetune": {
+          "type": "number",
+          "exclusiveMinimum": 0
+        },
+        "num_workers": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "pretrain_epochs": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "weight_decay": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "required": [
+        "amp",
+        "batch_size",
+        "eval_batch_size",
+        "finetune_epochs",
+        "grad_clip",
+        "lr_pretrain",
+        "lr_private_finetune",
+        "num_workers",
+        "pretrain_epochs",
+        "weight_decay"
+      ],
+      "additionalProperties": false
+    },
+    "domains": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": {
+        "pattern": "^[A-Za-z][A-Za-z0-9_]*$"
+      },
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "csv": {
+            "type": "string",
+            "minLength": 1
+          },
+          "label_column": {
+            "type": "string",
+            "minLength": 1
+          },
+          "benign_label": {
+            "type": "string",
+            "minLength": 1
+          },
+          "feature_columns": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "array",
+                "items": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "uniqueItems": true,
+                "minItems": 1
+              }
+            ]
+          },
+          "group_columns": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            },
+            "uniqueItems": true
+          },
+          "block_size": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "integer",
+                "minimum": 1
+              }
+            ]
+          },
+          "window_size": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "stride": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "csv",
+          "label_column",
+          "benign_label",
+          "feature_columns",
+          "group_columns",
+          "block_size",
+          "window_size",
+          "stride"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "required": [
+    "seed",
+    "split",
+    "model",
+    "training",
+    "domains"
+  ],
+  "additionalProperties": false
+}
