@@ -1,0 +1,116 @@
+
+import json
+import math
+import re
+from pathlib import Path
+
+
+MODEL_KEYS = {'latent_dim', 'probability_dim', 'num_units', 'num_heads', 'num_layers',
+              'seq_len', 'output_dim', 'encoder_hidden_dims', 'classifier_hidden_dims',
+              'ffn_dim', 'dropout', 'affinity_weight'}
+TRAIN_KEYS = {'batch_size', 'eval_batch_size', 'num_workers', 'pretrain_epochs',
+              'finetune_epochs', 'lr_pretrain', 'lr_private_finetune', 'weight_decay',
+              'grad_clip', 'amp'}
+DOMAIN_KEYS = {'csv', 'label_column', 'benign_label', 'feature_columns', 'group_columns',
+               'block_size', 'window_size', 'stride'}
+
+
+def _keys(value, required, optional, name):
+    if not isinstance(value, dict):
+        raise ValueError(f'{name} must be an object')
+    missing, unknown = required - set(value), set(value) - required - optional
+    if missing or unknown:
+        raise ValueError(f'{name}: missing keys {sorted(missing)}, unknown keys {sorted(unknown)}')
+
+
+def _integer(value, name, minimum=1):
+    if type(value) is not int or value < minimum:
+        raise ValueError(f'{name} must be an integer >= {minimum}')
+
+
+def _number(value, name, minimum=0, strict=False):
+    if type(value) not in (int, float) or not math.isfinite(value):
+        raise ValueError(f'{name} must be a finite number')
+    if value < minimum or (strict and value == minimum):
+        raise ValueError(f'{name} is out of range')
+
+
+def _columns(value, name, nonempty=False):
+    if not isinstance(value, list) or any(not isinstance(v, str) or not v for v in value):
+        raise ValueError(f'{name} must be a list of column names')
+    if len(set(value)) != len(value) or (nonempty and not value):
+        raise ValueError(f'{name} must contain unique column names')
+
+
+def validate_config(cfg):
+    _keys(cfg, {'seed', 'split', 'model', 'training', 'domains'}, set(), 'config')
+    _integer(cfg['seed'], 'seed', 0)
+    _keys(cfg['split'], {'test_fraction', 'validation_fraction_of_train'}, set(), 'split')
+    for key, value in cfg['split'].items():
+        _number(value, key, 0, True)
+        if value >= 1:
+            raise ValueError(f'{key} must be < 1')
+    m, t = cfg['model'], cfg['training']
+    _keys(m, MODEL_KEYS, set(), 'model')
+    _keys(t, TRAIN_KEYS, set(), 'training')
+    for key in ['latent_dim', 'probability_dim', 'num_units', 'num_heads', 'num_layers',
+                'seq_len', 'output_dim', 'ffn_dim']:
+        _integer(m[key], f'model.{key}')
+    if m['latent_dim'] % m['num_heads']:
+        raise ValueError('latent_dim must be divisible by num_heads')
+    for key in ['encoder_hidden_dims', 'classifier_hidden_dims']:
+        if not isinstance(m[key], list) or len(m[key]) != 2:
+            raise ValueError(f'{key} must specify exactly two hidden dimensions')
+        for width in m[key]:
+            _integer(width, key)
+    _number(m['dropout'], 'dropout')
+    if m['dropout'] >= 1:
+        raise ValueError('dropout must be < 1')
+    _number(m['affinity_weight'], 'affinity_weight')
+    for key in ['batch_size', 'eval_batch_size', 'pretrain_epochs', 'finetune_epochs']:
+        _integer(t[key], key)
+    if t['batch_size'] < 2:
+        raise ValueError('Training batch_size must be >= 2 for private BatchNorm heads')
+    _integer(t['num_workers'], 'num_workers', 0)
+    for key in ['lr_pretrain', 'lr_private_finetune', 'grad_clip']:
+        _number(t[key], key, 0, True)
+    if t['lr_private_finetune'] >= t['lr_pretrain']:
+        raise ValueError('Private fine-tuning learning rate must be lower than pretraining')
+    _number(t['weight_decay'], 'weight_decay')
+    if type(t['amp']) is not bool:
+        raise ValueError('amp must be a boolean')
+    if not isinstance(cfg['domains'], dict) or not cfg['domains']:
+        raise ValueError('domains must be a nonempty object')
+    for name, d in cfg['domains'].items():
+        if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_]*', name):
+            raise ValueError('Domain names must use letters, digits and underscores')
+        _keys(d, DOMAIN_KEYS, set(), f'domains.{name}')
+        for field in ['csv', 'label_column', 'benign_label']:
+            if not isinstance(d[field], str) or not d[field]:
+                raise ValueError(f'{name}.{field} must be a nonempty string')
+        if d['feature_columns'] is not None:
+            _columns(d['feature_columns'], 'feature_columns', True)
+        _columns(d['group_columns'], 'group_columns')
+        forbidden = set(d['group_columns']) | {d['label_column'], '__unit__', '__row__'}
+        if d['feature_columns'] is not None and forbidden.intersection(d['feature_columns']):
+            raise ValueError('feature_columns contains labels, collection IDs or reserved columns')
+        _integer(d['window_size'], 'window_size')
+        _integer(d['stride'], 'stride')
+        if not d['group_columns']:
+            _integer(d['block_size'], 'block_size')
+            span = d['window_size'] + (m['seq_len'] - 1) * d['stride']
+            if d['block_size'] < span:
+                raise ValueError('block_size is shorter than one complete sequence')
+        elif d['block_size'] is not None:
+            raise ValueError('Set block_size to null when group_columns is used')
+    return cfg
+
+
+def load_config(path):
+    path = Path(path).resolve()
+    with path.open(encoding='utf-8') as handle:
+        cfg = validate_config(json.load(handle))
+    for d in cfg['domains'].values():
+        csv = Path(d['csv']).expanduser()
+        d['csv'] = str((path.parent / csv).resolve() if not csv.is_absolute() else csv)
+    return cfg
