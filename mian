@@ -1,0 +1,93 @@
+
+import argparse
+from pathlib import Path
+
+from config import load_config
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='command', required=True)
+    check = sub.add_parser('check-config', help='Validate a private JSON file without importing PyTorch')
+    check.add_argument('--config', required=True)
+    train = sub.add_parser('train', help='Train and evaluate once on the independent test split')
+    train.add_argument('--config', required=True)
+    train.add_argument('--output-dir', required=True, help='New, private run directory')
+    train.add_argument('--device', default='cpu')
+    predict = sub.add_parser('predict', help='Predict one known domain using saved preprocessing')
+    predict.add_argument('--checkpoint', required=True)
+    predict.add_argument('--domain', required=True)
+    predict.add_argument('--csv', required=True)
+    predict.add_argument('--output', required=True)
+    predict.add_argument('--batch-size', type=int, required=True)
+    predict.add_argument('--device', default='cpu')
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    if args.command == 'check-config':
+        cfg = load_config(args.config)
+        for domain, spec in cfg['domains'].items():
+            if not Path(spec['csv']).is_file():
+                raise FileNotFoundError(f'Input CSV missing for {domain}')
+        print('Configuration valid; CSV files exist. Values were not printed.')
+        return
+    import pandas as pd
+    import torch
+    from torch.utils.data import DataLoader
+    from data_process import inference_dataset, prepare_domain
+    from mgol import MGOL
+    from trainer import train
+    from utils import seed_everything, write_json
+
+    device = torch.device(args.device)
+    if device.type not in ['cpu', 'cuda']:
+        raise ValueError('Supported devices are cpu and cuda')
+    if device.type == 'cuda' and not torch.cuda.is_available():
+        raise RuntimeError('CUDA was requested but is unavailable')
+    if args.command == 'train':
+        cfg = load_config(args.config)
+        output = Path(args.output_dir).resolve()
+        if output.exists() and any(output.iterdir()):
+            raise FileExistsError('Use a new empty output directory for each experiment')
+        seed_everything(cfg['seed'])
+        data = {}
+        for domain, spec in cfg['domains'].items():
+            print(f'Preparing {domain}...', flush=True)
+            data[domain] = prepare_domain(pd.read_csv(spec['csv']), spec, cfg)
+        info = {d: {'input_dim': b.datasets['train'].input_dim,
+                    'num_classes': len(b.classes)} for d, b in data.items()}
+        model = MGOL(info, cfg['model']).to(device)
+        result = train(model, data, info, cfg, device, output)
+        print('Training finished. Independent test metrics saved in the private run directory.')
+        for domain, metrics in result.items():
+            print(f'{domain}: accuracy={metrics["accuracy"]:.6f}, macro_f1={metrics["macro_f1"]:.6f}')
+    else:
+        if args.batch_size < 1:
+            raise ValueError('batch-size must be positive')
+        if Path(args.output).exists():
+            raise FileExistsError('Prediction output already exists')
+        saved = torch.load(args.checkpoint, map_location=device, weights_only=True)
+        if saved.get('format_version') != 1 or args.domain not in saved['domain_info']:
+            raise ValueError('Unsupported checkpoint format or unknown domain')
+        model = MGOL(saved['domain_info'], saved['model_config']).to(device)
+        model.load_state_dict(saved['state_dict'])
+        model.eval()
+        frame = pd.read_csv(args.csv)
+        state = saved['preprocessing'][args.domain]
+        dataset = inference_dataset(frame, state, saved['model_config']['seq_len'])
+        rows = []
+        with torch.no_grad():
+            for x, _ in DataLoader(dataset, batch_size=args.batch_size, shuffle=False):
+                probability = torch.softmax(model(x.to(device), args.domain)[0], -1).cpu()
+                for p in probability:
+                    rows.append({'label': state['classes'][int(p.argmax())], 'probabilities': p.tolist()})
+        write_json(args.output, {'domain': args.domain, 'classes': state['classes'],
+                                 'order': 'collection unit first appearance, then chronological sequence',
+                                 'predictions': rows})
+        print(f'Saved {len(rows)} predictions.')
+
+
+if __name__ == '__main__':
+    main()
